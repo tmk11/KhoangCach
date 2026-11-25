@@ -151,7 +151,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun warnUser() {
-        toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_LITE, 300)
+        toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
         val pattern = longArrayOf(0, 200, 150, 200)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
