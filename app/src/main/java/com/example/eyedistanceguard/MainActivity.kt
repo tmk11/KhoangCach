@@ -1,170 +1,182 @@
 package com.example.eyedistanceguard
 
 import android.Manifest
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.graphics.Rect
-import android.media.AudioManager
-import android.media.ToneGenerator
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.os.IBinder
+import android.provider.Settings
+import android.view.View
+import android.widget.Button
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.FaceDetection
-import com.google.mlkit.vision.face.FaceDetectorOptions
-import java.util.concurrent.Executors
-import kotlin.math.tan
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
+    private val prefs by lazy { getSharedPreferences("monitor", MODE_PRIVATE) }
+    private lateinit var preview: PreviewView
+    private lateinit var distance: TextView
+    private lateinit var status: TextView
+    private lateinit var thresholdLabel: TextView
+    private lateinit var slider: SeekBar
+    private lateinit var calibrate: Button
+    private lateinit var background: Button
+    private lateinit var recover: Button
+    private var service: MonitorService? = null
+    private var bound = false
+    private var visible = false
 
-    private lateinit var previewView: PreviewView
-    private lateinit var distanceText: TextView
-    private lateinit var statusText: TextView
+    private fun granted(permission: String) =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
-    private val executor = Executors.newSingleThreadExecutor()
-    private var thresholdCm = 30
-    private var tooCloseSince = 0L
-    private var lastBeepAt = 0L
-
-    private val AVERAGE_FACE_WIDTH_CM = 14.5f
-    private val HORIZONTAL_FOV_DEG = 60.0
-
-    private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startCamera()
-        }
-
-    private val detector by lazy {
-        FaceDetection.getClient(
-            FaceDetectorOptions.Builder()
-                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
-                .setMinFaceSize(0.15f)
-                .build()
-        )
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (visible) connectOrExplain()
+    }
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (visible) startBackground()
     }
 
-    private val toneGenerator by lazy { ToneGenerator(AudioManager.STREAM_ALARM, 80) }
-    private val vibrator by lazy { getSystemService(Vibrator::class.java) }
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            val monitor = (binder as MonitorService.LocalBinder).service
+            service = monitor
+            slider.progress = monitor.threshold - MIN_CM
+            monitor.attach(preview.surfaceProvider, ::render)
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+            service = null
+            render(Reading("Đang kết nối lại camera…"))
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
-        previewView = findViewById(R.id.previewView)
-        distanceText = findViewById(R.id.distanceText)
-        statusText = findViewById(R.id.statusText)
-
-        findViewById<SeekBar>(R.id.thresholdSeek).setOnSeekBarChangeListener(object :
-            SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                thresholdCm = progress
+        preview = findViewById(R.id.previewView)
+        distance = findViewById(R.id.distanceText)
+        status = findViewById(R.id.statusText)
+        thresholdLabel = findViewById(R.id.thresholdLabel)
+        slider = findViewById(R.id.thresholdSeek)
+        calibrate = findViewById(R.id.calibrate)
+        background = findViewById(R.id.background)
+        recover = findViewById(R.id.recover)
+        val initial = prefs.getInt("threshold", DEFAULT_CM).coerceIn(MIN_CM, MAX_CM)
+        slider.progress = initial - MIN_CM
+        thresholdLabel.text = "Ngưỡng cảnh báo: $initial cm"
+        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                val cm = MIN_CM + progress
+                thresholdLabel.text = "Ngưỡng cảnh báo: $cm cm"
+                if (fromUser) service?.changeThreshold(cm)
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStartTrackingTouch(bar: SeekBar) {}
+            override fun onStopTrackingTouch(bar: SeekBar) {}
         })
+        calibrate.setOnClickListener { showCalibration() }
+        background.setOnClickListener {
+            if (service?.background == true) service?.stopBackground()
+            else if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS) &&
+                !prefs.getBoolean("askedNotifications", false)) {
+                prefs.edit().putBoolean("askedNotifications", true).apply()
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else startBackground()
+        }
+        recover.setOnClickListener {
+            if (granted(Manifest.permission.CAMERA)) service?.retryCamera()
+            else if (shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) ||
+                !prefs.getBoolean("askedCamera", false)) askCamera()
+            else startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }
+        render(Reading("Đang mở camera…"))
+    }
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCamera()
-        } else {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
+    override fun onStart() {
+        super.onStart()
+        visible = true
+        connectOrExplain()
+        if (!granted(Manifest.permission.CAMERA) && !prefs.getBoolean("askedCamera", false)) askCamera()
+    }
+
+    private fun askCamera() {
+        prefs.edit().putBoolean("askedCamera", true).apply()
+        cameraPermission.launch(Manifest.permission.CAMERA)
+    }
+
+    private fun connectOrExplain() {
+        if (!granted(Manifest.permission.CAMERA)) {
+            render(Reading("Cần quyền camera trước để đo khoảng cách."))
+            recover.text = if (shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) "Cấp quyền camera" else "Mở cài đặt quyền camera"
+            recover.visibility = View.VISIBLE
+        } else if (!bound) {
+            render(Reading("Đang mở camera…"))
+            bound = bindService(Intent(this, MonitorService::class.java), connection, Context.BIND_AUTO_CREATE)
         }
     }
 
-    private fun startCamera() {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            val provider = future.get()
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-            analysis.setAnalyzer(executor, ::analyzeFrame)
-
-            provider.unbindAll()
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, preview, analysis)
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun analyzeFrame(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
-            imageProxy.close()
-            return
+    override fun onStop() {
+        visible = false
+        if (bound) {
+            service?.attach(null, null)
+            unbindService(connection)
+            bound = false
+            service = null
         }
-        val rotation = imageProxy.imageInfo.rotationDegrees
-        val input = InputImage.fromMediaImage(mediaImage, rotation)
-        detector.process(input)
-            .addOnSuccessListener { faces ->
-                val widest = faces.maxByOrNull { it.boundingBox.width() }?.boundingBox
-                if (widest == null) {
-                    runOnUiThread { distanceText.text = "-- cm"; statusText.text = "Không thấy khuôn mặt" }
-                } else {
-                    val rotatedWidth = if (rotation == 90 || rotation == 270) imageProxy.height else imageProxy.width
-                    val distanceCm = estimateDistanceCm(widest, rotatedWidth)
-                    onDistanceMeasured(distanceCm)
-                }
-            }
-            .addOnCompleteListener { imageProxy.close() }
+        super.onStop()
     }
 
-    private fun estimateDistanceCm(faceBox: Rect, imageWidthPx: Int): Float {
-        val focalPx = imageWidthPx / (2.0 * tan(Math.toRadians(HORIZONTAL_FOV_DEG) / 2.0))
-        return AVERAGE_FACE_WIDTH_CM * focalPx.toFloat() / faceBox.width()
+    private fun startBackground() {
+        if (service == null || !granted(Manifest.permission.CAMERA)) return
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, MonitorService::class.java)
+                .setAction(MonitorService.START_BACKGROUND))
+        } catch (e: RuntimeException) {
+            Toast.makeText(this, "Không thể bật theo dõi nền lúc này.", Toast.LENGTH_LONG).show()
+        }
     }
 
-    private fun onDistanceMeasured(distanceCm: Float) {
-        runOnUiThread {
-            val rounded = distanceCm.toInt()
-            distanceText.text = "$rounded cm"
-            val now = System.currentTimeMillis()
-            if (distanceCm >= thresholdCm + 10) {
-                tooCloseSince = 0L
-                distanceText.setTextColor(0xFF4CAF50.toInt())
-                statusText.text = "Khoảng cách an toàn cho đôi mắt 👍"
-            } else if (distanceCm >= thresholdCm) {
-                tooCloseSince = if (tooCloseSince == 0L) now else tooCloseSince
-                distanceText.setTextColor(0xFFFFC107.toInt())
-                statusText.text = "Sắp quá gần, hãy đẩy xa thêm chút"
-            } else {
-                tooCloseSince = if (tooCloseSince == 0L) now else tooCloseSince
-                distanceText.setTextColor(0xFFF44336.toInt())
-                statusText.text = "Quá gần mắt! Giữ khoảng cách tối thiểu $thresholdCm cm"
-                if (now - tooCloseSince > 2000 && now - lastBeepAt > 1500) {
-                    lastBeepAt = now
-                    warnUser()
-                }
+    private fun showCalibration() {
+        val dialog = AlertDialog.Builder(this).setTitle("Hiệu chuẩn ở $REFERENCE_CM cm")
+            .setMessage("Dùng thước đặt mắt cách màn hình $REFERENCE_CM cm. Nhìn thẳng, giữ yên và để một khuôn mặt trong khung hình, rồi nhấn Lưu.")
+            .setNegativeButton("Hủy", null).setPositiveButton("Lưu", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (service?.calibrate() == true) {
+                    dialog.dismiss()
+                    Toast.makeText(this, "Đã lưu hiệu chuẩn", Toast.LENGTH_SHORT).show()
+                } else dialog.setMessage("Chưa có mẫu ổn định. Giữ yên một khuôn mặt ở $REFERENCE_CM cm khoảng một giây, rồi nhấn Lưu lại.")
             }
         }
+        dialog.show()
     }
 
-    private fun warnUser() {
-        toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
-        val pattern = longArrayOf(0, 200, 150, 200)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(500)
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        executor.shutdown()
-        detector.close()
-        toneGenerator.release()
+    private fun render(reading: Reading) {
+        val monitor = service
+        val cm = reading.cm
+        val threshold = monitor?.threshold ?: DEFAULT_CM
+        distance.text = cm?.let { "${it.roundToInt()} cm" } ?: "-- cm"
+        distance.setTextColor(when {
+            cm == null -> -1
+            cm < threshold -> 0xFFEF5350.toInt()
+            cm < threshold + 10 -> 0xFFFFC107.toInt()
+            else -> 0xFF66BB6A.toInt()
+        })
+        status.text = reading.message
+        slider.isEnabled = monitor != null
+        background.isEnabled = monitor != null && (!reading.cameraError || monitor.background)
+        background.text = if (monitor?.background == true) "Dừng theo dõi nền" else "Theo dõi khi dùng ứng dụng khác"
+        calibrate.isEnabled = cm != null
+        recover.text = "Thử mở lại camera"
+        recover.visibility = if (reading.cameraError) View.VISIBLE else View.GONE
     }
 }
